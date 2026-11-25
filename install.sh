@@ -9,6 +9,19 @@ SRC=$(dirname "$0")/files
 
 echo "== 安装 luci-app-ontoneshot =="
 
+# 保存"安装前"的原始配置基线（总开关关闭时用它还原）
+BASELINE=/root/ontoneshot/baseline
+if [ ! -d "$BASELINE" ]; then
+	mkdir -p "$BASELINE"
+	for f in network dhcp firewall system; do
+		[ -f "/etc/config/$f" ] && cp -f "/etc/config/$f" "$BASELINE/$f"
+	done
+	[ -f /etc/sysctl.conf ] && cp -f /etc/sysctl.conf "$BASELINE/sysctl.conf"
+	echo "  已保存原始配置基线到 $BASELINE"
+else
+	echo "  原始配置基线已存在，保留"
+fi
+
 # 1. 配置文件：已存在则保留用户配置
 if [ ! -f /etc/config/ontoneshot ]; then
 	cp "$SRC/etc/config/ontoneshot" /etc/config/ontoneshot

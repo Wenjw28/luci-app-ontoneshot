@@ -17,6 +17,55 @@ cfg() {
 
 need_uci() { command -v uci >/dev/null 2>&1 || die "uci not found"; }
 
+# 原始配置基线：插件首次生效前自动保存，用于总开关关闭时还原
+BASELINE="$BACKUPDIR/baseline"
+
+# 保存原始基线（只在不存在时保存，保证是真正的"安装前"状态）
+save_baseline() {
+	[ -d "$BASELINE" ] && return 0
+	mkdir -p "$BASELINE" || return 1
+	for f in network dhcp firewall system; do
+		[ -f "/etc/config/$f" ] && cp -f "/etc/config/$f" "$BASELINE/$f"
+	done
+	[ -f /etc/sysctl.conf ] && cp -f /etc/sysctl.conf "$BASELINE/sysctl.conf"
+	log "  已保存原始配置基线到 $BASELINE"
+}
+
+# 总开关：关闭 => 还原基线；开启 => 按当前参数配置
+apply_switch() {
+	local en
+	en=$(cfg enabled 1)
+	if [ "$en" = "1" ]; then
+		log "== 插件已启用，按配置应用 =="
+		save_baseline
+		return 0
+	fi
+	log "== 插件已关闭，还原到安装前状态 =="
+	if [ ! -d "$BASELINE" ]; then
+		die "未找到原始配置基线（$BASELINE），无法还原。请手动恢复或先启用插件一次"
+	fi
+	restore_baseline
+}
+
+restore_baseline() {
+	local f
+	for f in network dhcp firewall system; do
+		[ -f "$BASELINE/$f" ] && cp -f "$BASELINE/$f" "/etc/config/$f" && log "  还原 $f"
+	done
+	[ -f "$BASELINE/sysctl.conf" ] && cp -f "$BASELINE/sysctl.conf" /etc/sysctl.conf && log "  还原 sysctl.conf"
+	uci commit
+	# 清掉插件插入的接口/设备
+	uci -q delete network.br_iptv; uci -q delete network.iptv
+	uci -q delete network.pon0_iptv; uci -q delete network.pon0_iptv_mcast
+	uci -q delete network.br_wan; uci -q delete network.wan_bridge
+	uci commit network
+	[ -x /etc/init.d/sysctl ] && /etc/init.d/sysctl restart >/dev/null 2>&1
+	ubus call network reload >/dev/null 2>&1
+	[ -x /etc/init.d/odhcpd ] && /etc/init.d/odhcpd restart >/dev/null 2>&1
+	[ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1
+	[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload >/dev/null 2>&1
+	log "  已恢复到安装前状态"
+}
 do_backup() {
 	mkdir -p "$BACKUPDIR" || die "无法创建 $BACKUPDIR"
 	local dst
@@ -159,12 +208,106 @@ ensure_fw_rule() {
 
 
 
+# 上网业务桥接：WAN VLAN 与指定网口桥接成 br-wan，由下游设备自行拨号
+#
+# 风险：如果选中的网口正好是当前管理入口，应用后会立刻失去访问。
+# 因此这里带 180 秒自动回滚保护：应用后若未在时限内确认，自动还原。
+#   确认命令： ontoneshot confirm
+apply_wan_bridge() {
+	local vlan="$1" port
+	port=$(cfg wan_bridge_port "")
+	[ -n "$port" ] || die "桥接模式需要指定上网桥接网口（lan1-lan4）"
+
+	local iptv_port
+	iptv_port=$(cfg iptv_port "")
+	if [ "$(cfg iptv_enabled 1)" = "1" ] && [ -n "$iptv_port" ] && [ "$port" = "$iptv_port" ]; then
+		die "上网桥接网口 $port 与 IPTV 出口网口冲突，请换一个"
+	fi
+
+	log "== 配置上网（桥接模式）=="
+	ensure_vlan_device pon0_wan "$vlan"
+
+	detach_port_from_lan "$port"
+
+	uci set network.br_wan=device
+	uci set network.br_wan.name=br-wan
+	uci set network.br_wan.type=bridge
+	uci -q delete network.br_wan.ports
+	uci add_list network.br_wan.ports="$port"
+	uci add_list network.br_wan.ports="pon0.$vlan"
+
+	# 桥接承载接口（auto=1 才会被 netifd 实例化）
+	uci set network.wan_bridge=interface
+	uci set network.wan_bridge.device=br-wan
+	uci set network.wan_bridge.proto=none
+	uci set network.wan_bridge.auto=1
+
+	# 本机不再拨号：wan 保留原参数但 auto=0，方便随时切回
+	uci set network.wan.auto=0
+
+	log "  br-wan = $port + pon0.$vlan（上网 VLAN $vlan 直通）"
+	log "  本机已停止 PPPoE，改由 $port 上的设备拨号"
+
+	uci commit network
+	ubus call network reload >/dev/null 2>&1
+	/sbin/ifdown wan 2>/dev/null
+	/sbin/ifup wan_bridge 2>/dev/null
+
+	# 自动回滚保护
+	start_bridge_guard
+	log "  上网桥接配置已提交"
+	log "  [安全] 180 秒内未确认将自动回滚。确认请执行：ontoneshot confirm"
+}
+
+# 启动回滚定时器（后台）
+start_bridge_guard() {
+	local guard=/tmp/ontoneshot-bridge-guard
+	rm -f "$guard"
+	mkdir -p "$BACKUPDIR"
+	# 打标记：未确认
+	: > "$guard.pending"
+	( sleep 180
+	  if [ -f "$guard.pending" ]; then
+		log "[自动回滚] 180 秒内未确认，正在还原上网配置"
+		uci set network.wan.auto=1
+		uci -q delete network.wan_bridge
+		local bp
+		bp=$(uci -q get network.br_wan.ports)
+		local op
+		for op in $bp; do
+			case "$op" in lan[0-9]) ls /sys/class/net/br-lan/brif/ 2>/dev/null | grep -q "^$op$" || uci add_list network.@device[0].ports="$op" ;; esac
+		done
+		uci -q delete network.br_wan
+		uci set ontoneshot.settings.wan_mode=route
+		uci commit network; uci commit ontoneshot
+		ubus call network reload >/dev/null 2>&1
+		/sbin/ifup wan 2>/dev/null
+		log "[自动回滚] 完成，已恢复路由模式"
+	  fi
+	) >/dev/null 2>&1 &
+}
+
+# 确认桥接生效，取消自动回滚
+confirm_bridge() {
+	rm -f /tmp/ontoneshot-bridge-guard.pending
+	log "已确认桥接配置，取消自动回滚"
+}
 apply_wan() {
 	need_uci
-	local vlan proto user pass
+	local vlan proto user pass mode bridge_port
 	vlan=$(cfg wan_vlan "")
 	[ -n "$vlan" ] || vlan=$(guess_wan_vlan)
 	[ -n "$vlan" ] || die "上网 VLAN 未配置，且无法从现有网络配置推断，请手动填写"
+	mode=$(cfg wan_mode route)
+
+	# 桥接模式：把上网 VLAN 直接桥到一个物理网口，
+	# 由该网口上的设备（例如另一台路由器）自己做 PPPoE/ DHCP。
+	# 本机不拨号，network.wan 只作为 br-wan 的容器接口存在。
+	if [ "$mode" = "bridge" ]; then
+		apply_wan_bridge "$vlan"
+		return $?
+	fi
+
 	proto=$(cfg wan_proto pppoe)
 	# 账号密码留空时沿用当前 network.wan 里的值（避免"刚装上没填"就报错）
 	user=$(cfg wan_user "")
@@ -174,6 +317,21 @@ apply_wan() {
 
 	log "== 配置上网 =="
 	ensure_vlan_device pon0_wan "$vlan"
+
+	# 路由模式：清掉可能残留的桥接配置
+	local bp0
+	bp0=$(uci -q get network.br_wan.ports)
+	uci -q delete network.wan_bridge
+	uci set network.wan.auto=1
+	rm -f /tmp/ontoneshot-bridge-guard.pending
+	if [ -n "$bp0" ]; then
+		local op
+		for op in $bp0; do
+			case "$op" in lan[0-9]) attach_port_to_lan "$op" ;; esac
+		done
+		uci -q delete network.br_wan
+		log "  已切回路由模式，桥接网口归还 br-lan"
+	fi
 
 	uci set network.wan=interface
 	uci set network.wan.device="pon0.$vlan"
@@ -475,20 +633,33 @@ usage() {
   all       全部执行
   backup    备份当前配置
   restore   恢复最近备份
+  apply     按总开关应用（开=配置，关=还原）
+  confirm   确认桥接生效（取消自动回滚）
+  reapply   重新应用桥接参数
 EOF
 }
 
 case "$1" in
 	wan|iptv|ipv6)
 		[ "$2" = "--no-backup" ] || do_backup
+		if [ "$(cfg enabled 1)" != "1" ]; then
+			log "插件已关闭，当前为安装前状态。如需配置请先开启总开关"
+			exit 0
+		fi
+		save_baseline
 		"apply_$1" || exit 1
 		;;
 	all)
 		do_backup
-		apply_wan && apply_iptv && apply_ipv6 || exit 1
+		apply_switch || exit 1
+		if [ "$(cfg enabled 1)" = "1" ]; then
+			apply_wan && apply_iptv && apply_ipv6 || exit 1
+		fi
 		;;
 	backup) do_backup ;;
+	apply) apply_switch ;;
 	reapply) reapply_bridge_tweaks ;;
+	confirm) confirm_bridge ;;
 	reapply-wait) reapply_wait ;;
 	restore) do_restore ;;
 	*) usage; exit 1 ;;

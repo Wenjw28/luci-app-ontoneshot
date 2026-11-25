@@ -1,5 +1,8 @@
 config settings 'settings'
+	option enabled '1'
 	option wan_proto 'pppoe'
+	option wan_mode 'route'
+	option wan_bridge_port ''
 	option wan_vlan ''
 	option wan_user ''
 	option wan_pass ''

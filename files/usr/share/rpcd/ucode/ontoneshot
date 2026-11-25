@@ -21,6 +21,9 @@ function readConfig() {
 	let c = cursor();
 	let v = c.get_all(CONFIG, 'settings') ?? {};
 	return {
+		enabled: v.enabled ?? '1',
+		wan_mode: v.wan_mode ?? 'route',
+		wan_bridge_port: v.wan_bridge_port ?? '',
 		wan_proto: v.wan_proto ?? 'pppoe',
 		wan_vlan: v.wan_vlan ?? '',
 		wan_user: v.wan_user ?? '',
@@ -79,10 +82,25 @@ function status() {
 	if (fd) fd.close();
 	st.backup = trim(out);
 
+	fd = popen('test -d /root/ontoneshot/baseline && echo yes || echo no');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.has_baseline = (trim(out) === 'yes');
+
 	fd = popen('uci -q get network.wan.device 2>/dev/null');
 	out = fd ? (fd.read('all') ?? '') : '';
 	if (fd) fd.close();
 	st.wan_device = trim(out);
+
+	fd = popen('uci -q get network.br_wan.name 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.wan_bridge = trim(out);
+
+	fd = popen('uci -q get network.wan.proto 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.wan_proto_actual = trim(out);
 
 	fd = popen('uci -q get dhcp.lan.ra_default 2>/dev/null');
 	out = fd ? (fd.read('all') ?? '') : '';
@@ -109,7 +127,7 @@ function status() {
 function saveConfig(settings) {
 	let c = cursor();
 	let keys = [
-		'wan_proto', 'wan_vlan', 'wan_user', 'wan_pass', 'wan_ip', 'wan_gw',
+		'enabled', 'wan_mode', 'wan_bridge_port', 'wan_proto', 'wan_vlan', 'wan_user', 'wan_pass', 'wan_ip', 'wan_gw',
 		'iptv_enabled', 'iptv_vlan', 'iptv_mcast_vlan', 'iptv_port', 'iptv_priority',
 		'ipv6_enabled', 'ipv6_ra_default', 'ipv6_pd', 'ipv6_pd_size'
 	];

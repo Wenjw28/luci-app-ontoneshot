@@ -13,7 +13,7 @@ var callAll     = rpc.declare({ object: 'ontoneshot', method: 'apply_all',   exp
 var callRestore = rpc.declare({ object: 'ontoneshot', method: 'restore',     expect: { '': {} } });
 
 var FIELDS = [
-	'wan_proto', 'wan_vlan', 'wan_user', 'wan_pass', 'wan_ip', 'wan_gw',
+	'enabled', 'wan_mode', 'wan_bridge_port', 'wan_proto', 'wan_vlan', 'wan_user', 'wan_pass', 'wan_ip', 'wan_gw',
 	'iptv_enabled', 'iptv_vlan', 'iptv_mcast_vlan', 'iptv_port', 'iptv_priority',
 	'ipv6_enabled', 'ipv6_ra_default', 'ipv6_pd', 'ipv6_pd_size'
 ];
@@ -45,6 +45,13 @@ function readSettings() {
 		// 文本输入框留空 = 保持设备上现有值，不下发（避免把配置清空）
 		if (val === '' && ALWAYS_SEND.indexOf(key) < 0)
 			continue;
+
+		// 桥接网口只在桥接模式下有意义，路由模式不下发
+		if (key === 'wan_bridge_port') {
+			var wm = byId('wan_mode');
+			if (!wm || wm.value !== 'bridge')
+				continue;
+		}
 
 		out[key] = val;
 	}
@@ -100,19 +107,21 @@ function textField(key, password) {
 	return el;
 }
 
-function selectField(key, options) {
+// allowEmpty=true 时首项为空值（"-"），表示未选择，不会被下发
+function selectField(key, options, allowEmpty) {
 	var sel = E('select', {
 		'id': 'ontoneshot-' + key,
 		'class': 'cbi-input-select',
 		'style': 'min-width:320px'
 	});
 
-	var want = (CFG[key] == null || CFG[key] === '') ? options[0][0] : String(CFG[key]);
+	if (allowEmpty)
+		sel.appendChild(E('option', { 'value': '' }, '-'));
 
 	for (var i = 0; i < options.length; i++)
 		sel.appendChild(E('option', { 'value': options[i][0] }, options[i][1]));
 
-	sel.value = want;
+	sel.value = (CFG[key] == null) ? (allowEmpty ? '' : options[0][0]) : String(CFG[key]);
 
 	return sel;
 }
@@ -150,9 +159,8 @@ return view.extend({
 
 			if (el.type === 'checkbox')
 				el.checked = (v === '1' || v === 1 || v === true);
-			else if (el.tagName === 'SELECT')
+			else
 				el.value = (v == null) ? '' : String(v);
-			// 文本输入框保持空白，由用户按需填写
 		}
 	},
 
@@ -206,7 +214,8 @@ return view.extend({
 				row(_('IPv6'), [ badge(st.ipv6_ok ? _('正常') : _('未获取'), st.ipv6_ok), ' ',
 					st.ipv6_prefix ? E('code', {}, st.ipv6_prefix) : '' ]),
 				st.ipv6_lan ? row(_('LAN IPv6'), E('code', { 'style': 'font-size:11px' }, st.ipv6_lan)) : '',
-				st.wan_device ? row(_('WAN 接口'), E('code', {}, st.wan_device)) : '',
+				st.wan_bridge ? row(_('WAN 模式'), E('code', {}, _('桥接 (%s)').format(st.wan_bridge)))
+					: (st.wan_device ? row(_('WAN 接口'), E('code', {}, st.wan_device)) : ''),
 				st.wan_account ? row(_('PPPoE 账号'), E('code', {}, st.wan_account)) : '',
 				st.mcast_vlan ? row(_('组播接口'), E('code', {}, st.mcast_vlan)) : '',
 				row(_('最近备份'), st.backup ? E('code', { 'style': 'font-size:11px' }, st.backup) : _('无'))
@@ -216,15 +225,29 @@ return view.extend({
 
 	buildForm: function() {
 		return E('div', { 'class': 'cbi-section' }, [
+			E('h3', {}, _('总开关')),
+			E('div', { 'class': 'cbi-section-node' }, [
+				checkField('enabled', _('启用插件配置')),
+				E('div', { 'class': 'cbi-value-description', 'style': 'margin-left:26%' },
+					_('关闭并应用后，将恢复到插件安装前的状态（原厂/原有网络配置）。<br>开启则按下方参数重新配置。'))
+			]),
+
 			E('h3', {}, _('配置参数')),
 
 			E('div', { 'class': 'cbi-section-node' }, [
 				E('h4', {}, _('上网')),
+				field(_('上网模式'), selectField('wan_mode', [
+					[ 'route',  _('路由：本机拨号并分配给内网（默认）') ],
+					[ 'bridge', _('桥接：上网 VLAN 直通指定网口，由下游设备拨号') ]
+				])),
+				field(_('上网桥接网口'), selectField('wan_bridge_port', [
+					[ 'lan1', 'lan1' ], [ 'lan2', 'lan2' ], [ 'lan3', 'lan3' ], [ 'lan4', 'lan4' ]
+				], true), _('仅「桥接」模式需要。该网口上的设备自行 PPPoE / DHCP，不能与 IPTV 出口网口相同。<br><b style="color:#c62828">注意：所选网口不能是当前管理入口（例如从该网口接的电脑访问本页），否则提交后会立刻失联。</b><br>应用后有 180 秒自动回滚保护，确认无误请执行 <code>ontoneshot confirm</code>。')),
 				field(_('上网方式'), selectField('wan_proto', [
 					[ 'pppoe',  _('PPPoE 拨号（多数宽带）') ],
 					[ 'dhcp',   _('DHCP 自动获取') ],
 					[ 'static', _('静态 IP') ]
-				])),
+				]), _('仅「路由」模式需要。')),
 				field(_('上网 VLAN ID'), textField('wan_vlan'),
 					_('运营商上网业务 VLAN。留空则保持当前配置。')),
 				field(_('PPPoE 账号'), textField('wan_user'),

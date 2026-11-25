@@ -1,5 +1,8 @@
 # 光猫一键配置（luci-app-ontoneshot）
 
+[![build](https://github.com/Wenjw28/luci-app-ontoneshot/actions/workflows/build.yml/badge.svg)](https://github.com/Wenjw28/luci-app-ontoneshot/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/Wenjw28/luci-app-ontoneshot?include_prereleases&sort=semver)](https://github.com/Wenjw28/luci-app-ontoneshot/releases)
+
 PonWrt / ImmortalWrt 光猫一键配置插件：一键设置**上网**、**IPTV**、**IPv6**，带总开关可一键还原。
 
 License: GPL-2.0
@@ -36,6 +39,23 @@ License: GPL-2.0
 - UCI + rpcd + LuCI，纯配置改动，不安装任何额外组件
 
 ## 安装
+
+### 方式一：下载 Release 安装包（推荐）
+
+到 [Releases](https://github.com/Wenjw28/luci-app-ontoneshot/releases) 下载最新的
+`luci-app-ontoneshot-*.apk`（apk 系统）或 `luci-app-ontoneshot_*.ipk`（opkg 系统），上传到路由器后：
+
+```sh
+# PonWrt / ImmortalWrt 快照（apk）
+apk add --allow-untrusted ./luci-app-ontoneshot-*.apk
+
+# OpenWrt 23.05 及更早（opkg）
+opkg install ./luci-app-ontoneshot_*.ipk
+```
+
+> 本插件与固件同源构建，安装后自动保存配置基线并重启 rpcd / uhttpd。
+
+### 方式二：源码安装
 
 把整个目录上传到路由器，然后：
 

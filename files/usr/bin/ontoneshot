@@ -1,0 +1,496 @@
+#!/bin/sh
+# ontoneshot - PonWrt 一键配置（上网 / IPTV / IPv6）
+# 所有改动走 UCI，支持 backup / restore 回滚。
+
+CONFIG=ontoneshot
+BACKUPDIR=/root/ontoneshot
+
+log() { echo "$*"; }
+die() { echo "ERROR: $*"; exit 1; }
+
+cfg() {
+	local v
+	v=$(uci -q get "$CONFIG.settings.$1" 2>/dev/null)
+	[ -n "$v" ] || v="$2"
+	echo "$v"
+}
+
+need_uci() { command -v uci >/dev/null 2>&1 || die "uci not found"; }
+
+do_backup() {
+	mkdir -p "$BACKUPDIR" || die "无法创建 $BACKUPDIR"
+	local dst
+	dst="$BACKUPDIR/backup-$(date +%Y%m%d-%H%M%S)"
+	mkdir -p "$dst"
+	for f in network dhcp firewall system "$CONFIG"; do
+		[ -f "/etc/config/$f" ] && cp -f "/etc/config/$f" "$dst/$f"
+	done
+	[ -f /etc/sysctl.conf ] && cp -f /etc/sysctl.conf "$dst/sysctl.conf"
+	ln -sfn "$dst" "$BACKUPDIR/latest"
+	log "已备份到 $dst"
+}
+
+latest_backup() {
+	[ -e "$BACKUPDIR/latest" ] || return 1
+	readlink -f "$BACKUPDIR/latest"
+}
+
+device_sections() {
+	uci show network 2>/dev/null | sed -n 's/^network\.\([^.]*\)=device$/\1/p'
+}
+
+# ensure_vlan_device <section> <vid>
+# 从 network.wan 当前设备名反推上网 VLAN（例如 pon0.<vid> -> vid）
+guess_wan_vlan() {
+	local dev v
+	dev=$(uci -q get network.wan.device)
+	v=$(echo "$dev" | sed -n 's/^pon0\.\([0-9][0-9]*\)$/\1/p')
+	echo "$v"
+}
+
+# 从 network.pon0_iptv 当前设备名反推 IPTV VLAN
+guess_iptv_vlan() {
+	local v
+	v=$(uci -q get network.pon0_iptv.vid)
+	[ -n "$v" ] || v=$(echo "$(uci -q get network.iptv.device)" | sed -n 's/^pon0\.\([0-9][0-9]*\)$/\1/p')
+	echo "$v"
+}
+
+ensure_vlan_device() {
+	local sec="$1" vid="$2" devname="pon0.$2"
+	local old t i n
+	for old in $(device_sections); do
+		[ "$old" = "$sec" ] && continue
+		t=$(uci -q get "network.$old.type")
+		[ "$t" = "8021q" ] || continue
+		i=$(uci -q get "network.$old.ifname")
+		[ "$i" = "pon0" ] || [ "$i" = "wan" ] || continue
+		n=$(uci -q get "network.$old.name")
+		[ "$n" = "$devname" ] && uci -q delete "network.$old"
+	done
+	uci set "network.$sec=device"
+	uci set "network.$sec.type=8021q"
+	uci set "network.$sec.ifname=pon0"
+	uci set "network.$sec.vid=$vid"
+	uci set "network.$sec.name=$devname"
+	log "  VLAN $vid 设备 $devname 就绪"
+}
+
+detach_port_from_lan() {
+	local port="$1" sec name p newports removed=0
+	for sec in $(device_sections); do
+		name=$(uci -q get "network.$sec.name")
+		[ "$name" = "br-lan" ] || continue
+		newports=""
+		for p in $(uci -q get "network.$sec.ports"); do
+			if [ "$p" = "$port" ]; then removed=1; continue; fi
+			newports="$newports $p"
+		done
+		uci -q delete "network.$sec.ports"
+		for p in $newports; do
+			uci add_list "network.$sec.ports=$p"
+		done
+	done
+	if [ "$removed" = 1 ]; then log "  已把 $port 从 br-lan 摘除"
+	else log "  $port 本就不在 br-lan 中"; fi
+}
+
+attach_port_to_lan() {
+	local port="$1" sec name p have
+	for sec in $(device_sections); do
+		name=$(uci -q get "network.$sec.name")
+		[ "$name" = "br-lan" ] || continue
+		have=0
+		for p in $(uci -q get "network.$sec.ports"); do
+			[ "$p" = "$port" ] && have=1
+		done
+		if [ "$have" = 0 ]; then
+			uci add_list "network.$sec.ports=$port"
+			log "  已把 $port 放回 br-lan"
+		fi
+	done
+}
+
+# 把被旧配置摘走、现在两边都不在的 LAN 口补回 br-lan
+restore_orphan_lan_ports() {
+	local keep="$1"   # 当前 IPTV 出口口，不要动
+	local sec p missing=""
+	local allports="lan1 lan2 lan3 lan4"
+	local inlan iniptv
+	inlan=$(uci -q get network.@device[0].ports)
+	iniptv=""
+	[ -n "$(uci -q get network.br_iptv.name)" ] && iniptv=$(uci -q get network.br_iptv.ports)
+	for p in $allports; do
+		[ "$p" = "$keep" ] && continue
+		case " $inlan " in *" $p "*) continue ;; esac
+		case " $iniptv " in *" $p "*) continue ;; esac
+		missing="$missing $p"
+	done
+	[ -z "$missing" ] && return 0
+	for sec in $(device_sections); do
+		[ "$(uci -q get "network.$sec.name")" = "br-lan" ] || continue
+		for p in $missing; do
+			uci add_list "network.$sec.ports=$p"
+			log "  已把 $p 补回 br-lan"
+		done
+	done
+}
+
+ensure_fw_rule() {
+	local name="$1" proto="$2" port="$3" family="$4" types="$5"
+	local sec
+	for sec in $(uci show firewall 2>/dev/null | sed -n 's/^firewall\.\([^.]*\)=rule$/\1/p'); do
+		[ "$(uci -q get "firewall.$sec.name")" = "$name" ] && return 0
+	done
+	local s
+	s=$(uci add firewall rule)
+	uci set "firewall.$s.name=$name"
+	uci set "firewall.$s.src=wan"
+	uci set "firewall.$s.proto=$proto"
+	[ -n "$port" ] && uci set "firewall.$s.dest_port=$port"
+	[ -n "$family" ] && uci set "firewall.$s.family=$family"
+	if [ -n "$types" ]; then
+		local t
+		for t in $types; do uci add_list "firewall.$s.icmp_type=$t"; done
+	fi
+	uci set "firewall.$s.target=ACCEPT"
+	log "  已补防火墙规则 $name"
+}
+
+
+
+apply_wan() {
+	need_uci
+	local vlan proto user pass
+	vlan=$(cfg wan_vlan "")
+	[ -n "$vlan" ] || vlan=$(guess_wan_vlan)
+	[ -n "$vlan" ] || die "上网 VLAN 未配置，且无法从现有网络配置推断，请手动填写"
+	proto=$(cfg wan_proto pppoe)
+	# 账号密码留空时沿用当前 network.wan 里的值（避免"刚装上没填"就报错）
+	user=$(cfg wan_user "")
+	[ -n "$user" ] || user=$(uci -q get network.wan.username)
+	pass=$(cfg wan_pass "")
+	[ -n "$pass" ] || pass=$(uci -q get network.wan.password)
+
+	log "== 配置上网 =="
+	ensure_vlan_device pon0_wan "$vlan"
+
+	uci set network.wan=interface
+	uci set network.wan.device="pon0.$vlan"
+	uci set network.wan.proto="$proto"
+	uci set network.wan.norelease=1
+	uci -q delete network.wan.ipv6
+
+	case "$proto" in
+	pppoe)
+		[ -n "$user" ] || die "PPPoE 账号为空"
+		[ -n "$pass" ] || die "PPPoE 密码为空"
+		uci -q delete network.wan.ipaddr
+		uci -q delete network.wan.gateway
+		uci set network.wan.username="$user"
+		uci set network.wan.password="$pass"
+		log "  PPPoE 账号 $user  VLAN $vlan"
+		;;
+	dhcp)
+		uci -q delete network.wan.username
+		uci -q delete network.wan.password
+		uci -q delete network.wan.ipaddr
+		uci -q delete network.wan.gateway
+		log "  DHCP  VLAN $vlan"
+		;;
+	static)
+		local ip gw
+		ip=$(cfg wan_ip "")
+		gw=$(cfg wan_gw "")
+		[ -n "$ip" ] || die "静态 IP 为空"
+		uci -q delete network.wan.username
+		uci -q delete network.wan.password
+		uci set network.wan.ipaddr="$ip"
+		if [ -n "$gw" ]; then uci set network.wan.gateway="$gw"; else uci -q delete network.wan.gateway; fi
+		log "  静态 IP $ip  网关 $gw"
+		;;
+	*) die "未知上网方式: $proto" ;;
+	esac
+
+	uci commit network
+	ubus call network reload >/dev/null 2>&1
+	/sbin/ifup wan 2>/dev/null
+	log "  上网配置已提交"
+}
+
+# 给 IPTV VLAN 设备打 802.1p 优先级（运营商常按优先级区分业务）
+# 运营商侧常按优先级做业务区分，缺了可能被丢弃
+set_vlan_priority() {
+	local dev="$1" prio="$2"
+	[ -d "/sys/class/net/$dev" ] || return 0
+	[ -n "$prio" ] || return 0
+	ip link set "$dev" type vlan egress-qos-map "0:$prio" 2>/dev/null && \
+		log "  802.1p 优先级 $(basename "$dev") = $prio" || \
+		log "  [警告] 设置 $dev 优先级失败"
+}
+
+# IPTV 桥接的关键修复（bridge 参数不进 UCI，必须每次重新设置）
+#
+# 点播 VLAN 和组播 VLAN 必须在同一个桥里，否则机顶盒拿不到组播。
+# 但两条 VLAN 直接桥接会有三个致命问题：
+#
+# 1) FDB 冲突：运营商网关的 MAC 在两条 VLAN 上都出现，桥会把它学到
+#    组播口上，导致机顶盒发给网关的 DHCP/DNS/认证单播被转去组播 VLAN，
+#    永远到不了运营商 —— 现象就是"IPTV 获取不到地址"。
+#    修复：组播口 learning off（它只承载组播，不该学单播 MAC）。
+#
+# 2) 组播回灌：组播从组播 VLAN 进来后会泛洪到桥里所有端口，
+#    包括点播 VLAN，等于原路打回运营商（实测可达每秒数 MB）。
+#    修复：点播口 mcast_flood off。
+#
+# 3) 单播误泛洪：机顶盒的单播被泛洪到组播 VLAN，干扰运营商业务。
+#    修复：组播口 flood off。
+fix_iptv_bridge() {
+	local vlan="$1" mcast="$2"
+
+	[ -d "/sys/class/net/br-iptv" ] || return 0
+
+	if [ -n "$mcast" ] && [ "$mcast" != "$vlan" ]; then
+		bridge link set dev "pon0.$vlan"  mcast_flood off 2>/dev/null && \
+			log "  pon0.$vlan 关闭组播泛洪（防回灌运营商）"
+		bridge link set dev "pon0.$mcast" learning    off 2>/dev/null && \
+			log "  pon0.$mcast 关闭 MAC 学习（防 FDB 冲突）"
+		bridge link set dev "pon0.$mcast" flood       off 2>/dev/null && \
+			log "  pon0.$mcast 关闭单播泛洪"
+	fi
+}
+
+# 开机后重新应用（bridge 参数不进 UCI，重启会丢）
+# 等待 br-iptv 就绪后再应用（供开机服务调用）
+reapply_wait() {
+	local i=0
+	while [ "$i" -lt 12 ]; do
+		[ -d /sys/class/net/br-iptv ] && break
+		sleep 5
+		i=$((i + 1))
+	done
+	[ -d /sys/class/net/br-iptv ] || exit 0
+	reapply_bridge_tweaks
+}
+
+reapply_bridge_tweaks() {
+	local vlan mcast
+	[ "$(cfg iptv_enabled 1)" = "1" ] || return 0
+	vlan=$(cfg iptv_vlan "")
+	[ -n "$vlan" ] || vlan=$(guess_iptv_vlan)
+	mcast=$(cfg iptv_mcast_vlan "")
+	set_vlan_priority "pon0.$vlan" "$(cfg iptv_priority "")"
+	if [ -n "$mcast" ] && [ "$mcast" != "$vlan" ]; then
+		set_vlan_priority "pon0.$mcast" "$(cfg iptv_priority "")"
+	fi
+	fix_iptv_bridge "$vlan" "$mcast"
+}
+apply_iptv() {
+	need_uci
+	local en vlan mcast port prio
+	en=$(cfg iptv_enabled 1)
+	if [ "$en" != "1" ]; then
+		log "== IPTV 未启用，清理已有 IPTV 配置 =="
+		local p0
+		p0=$(cfg iptv_port "")
+		[ -n "$p0" ] || p0=lan1
+		attach_port_to_lan "$p0"
+		uci -q delete network.br_iptv
+		uci -q delete network.iptv
+		uci -q delete network.pon0_iptv
+		uci -q delete network.pon0_iptv_mcast
+		uci commit network
+		ubus call network reload >/dev/null 2>&1
+		log "  已移除 IPTV 配置，$p0 已归还 br-lan"
+		return 0
+	fi
+	vlan=$(cfg iptv_vlan "")
+	[ -n "$vlan" ] || vlan=$(guess_iptv_vlan)
+	[ -n "$vlan" ] || die "IPTV VLAN 未配置，且无法从现有网络配置推断，请手动填写"
+	mcast=$(cfg iptv_mcast_vlan "")
+	port=$(cfg iptv_port "")
+	[ -n "$port" ] || die "IPTV 出口网口未配置（请先在页面上选择 lan1-lan4）"
+
+	log "== 配置 IPTV ==（桥接模式，VLAN $vlan，出口 $port）"
+	ensure_vlan_device pon0_iptv "$vlan"
+
+	# 独立组播 VLAN（运营商把组播放在另一个 VLAN 时填写）
+	uci -q delete network.pon0_iptv_mcast
+	if [ -n "$mcast" ] && [ "$mcast" != "$vlan" ]; then
+		ensure_vlan_device pon0_iptv_mcast "$mcast"
+		log "  组播 VLAN $mcast -> pon0.$mcast"
+	else
+		mcast=""
+	fi
+
+	# 固定桥接模式：出口网口 + 运营商 VLAN 桥接，机顶盒直连运营商自行取址
+	detach_port_from_lan "$port"
+	uci set network.br_iptv=device
+	uci set network.br_iptv.name=br-iptv
+	uci set network.br_iptv.type=bridge
+	uci -q delete network.br_iptv.ports
+	uci add_list network.br_iptv.ports="$port"
+	uci add_list network.br_iptv.ports="pon0.$vlan"
+	if [ -n "$mcast" ]; then
+		uci add_list network.br_iptv.ports="pon0.$mcast"
+	fi
+	uci set network.iptv=interface
+	uci set network.iptv.device=br-iptv
+	uci set network.iptv.proto=none
+	uci set network.iptv.auto=1
+	if [ -n "$mcast" ]; then
+		log "  br-iptv = $port + pon0.$vlan（点播）+ pon0.$mcast（组播）"
+	else
+		log "  br-iptv = $port + pon0.$vlan（机顶盒直连运营商）"
+	fi
+	restore_orphan_lan_ports "$port"
+	uci commit network
+	uci commit firewall 2>/dev/null
+	ubus call network reload >/dev/null 2>&1
+	[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload >/dev/null 2>&1
+
+	# 端口级修复：FDB 冲突 / 组播回灌 / 单播误泛洪
+	prio=$(cfg iptv_priority "")
+	set_vlan_priority "pon0.$vlan" "$prio"
+	if [ -n "$mcast" ]; then
+		set_vlan_priority "pon0.$mcast" "$prio"
+	fi
+	fix_iptv_bridge "$vlan" "$mcast"
+	log "  IPTV 配置已提交"
+}
+
+marker_begin="# BEGIN ontoneshot ipv6"
+marker_end="# END ontoneshot ipv6"
+
+write_sysctl_ipv6() {
+	local f=/etc/sysctl.conf tmp=/etc/sysctl.conf.ontoneshot.tmp
+	[ -f "$f" ] || : > "$f"
+	awk -v b="$marker_begin" -v e="$marker_end" '
+		$0==b {skip=1; next}
+		$0==e {skip=0; next}
+		skip!=1 {print}
+	' "$f" | grep -v '^net\.ipv6\.conf\.all\.disable_ipv6' | grep -v '^net\.ipv6\.conf\.default\.disable_ipv6' | grep -v '^net\.ipv6\.conf\.all\.forwarding' > "$tmp"
+	mv "$tmp" "$f"
+	{
+		echo "$marker_begin"
+		echo "net.ipv6.conf.all.disable_ipv6=0"
+		echo "net.ipv6.conf.default.disable_ipv6=0"
+		echo "net.ipv6.conf.all.forwarding=1"
+		echo "$marker_end"
+	} >> "$f"
+	log "  已更新 /etc/sysctl.conf"
+}
+
+apply_ipv6() {
+	need_uci
+	local en
+	en=$(cfg ipv6_enabled 1)
+	if [ "$en" != "1" ]; then log "== IPv6 未启用，跳过 =="; return 0; fi
+	log "== 开启 IPv6 =="
+
+	# 下游若还有路由器（二级路由），需要给它留出可委派的前缀空间（DHCPv6-PD）
+	if [ "$(cfg ipv6_pd 0)" = "1" ]; then
+		local pdsz
+		pdsz=$(cfg ipv6_pd_size "")
+		[ -n "$pdsz" ] || pdsz=$(uci -q get network.lan.ip6assign)
+		[ -n "$pdsz" ] || die "LAN 前缀长度未配置，且无法从现有配置推断，请手动填写"
+		uci set network.lan.ip6assign="$pdsz"
+		log "  LAN 前缀长度 /$pdsz（向下游开放 PD 委派）"
+	else
+		uci set network.lan.ip6assign=64
+	fi
+	uci set network.lan.ip6ifaceid=eui64
+	uci -q delete network.lan.ip6class
+	uci -q delete network.wan.ipv6
+	uci -q delete network.lan.ipv6
+
+	uci set dhcp.lan.dhcpv6=server
+	uci set dhcp.lan.ra=server
+	uci set dhcp.lan.ra_management=1
+	uci -q delete dhcp.lan.ndp
+	uci set dhcp.odhcpd.maindhcp=0
+
+	# 关键：二级路由/下游设备要能收到带默认路由的 RA。
+	# 没有 ra_default=1 时 odhcpd 会因自身无 IPv6 默认路由而把 RA 的
+	# Router Lifetime 设成 0，下游路由不会把本机当 IPv6 网关。
+	if [ "$(cfg ipv6_ra_default 1)" = "1" ]; then
+		uci set dhcp.lan.ra_default=1
+	else
+		uci -q delete dhcp.lan.ra_default
+	fi
+
+	# 下游路由器需要通过 DHCPv6-PD 拿到前缀才能继续给它们的内网分 IPv6
+	uci -q delete dhcp.lan.ndproxy
+	uci set dhcp.lan.ra_management=1
+	uci set dhcp.@dnsmasq[0].filter_aaaa=0
+	uci set dhcp.@dnsmasq[0].filter_a=0
+
+	ensure_fw_rule "Allow-DHCPv6" "udp" "546" "ipv6" ""
+	ensure_fw_rule "Allow-MLD" "icmp" "" "ipv6" "130/0 131/0 132/0 133/0 134/0 135/0 136/0"
+	ensure_fw_rule "Allow-ICMPv6-Input" "icmp" "" "ipv6" "1 2 3 4 128 129 133 134 135 136"
+
+	write_sysctl_ipv6
+
+	uci commit network
+	uci commit dhcp
+	uci commit firewall
+
+	sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+	sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+	sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+	sysctl -p /etc/sysctl.conf >/dev/null 2>&1
+	[ -x /etc/init.d/sysctl ] && /etc/init.d/sysctl restart >/dev/null 2>&1
+
+	ubus call network reload >/dev/null 2>&1
+	[ -x /etc/init.d/odhcpd ] && /etc/init.d/odhcpd restart >/dev/null 2>&1
+	[ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1
+	[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload >/dev/null 2>&1
+	log "  IPv6 已开启"
+}
+
+do_restore() {
+	local src
+	src=$(latest_backup) || die "没有可用备份"
+	[ -d "$src" ] || die "备份目录不存在: $src"
+	log "== 从 $src 恢复 =="
+	for f in network dhcp firewall system "$CONFIG"; do
+		[ -f "$src/$f" ] && cp -f "$src/$f" "/etc/config/$f" && log "  恢复 $f"
+	done
+	[ -f "$src/sysctl.conf" ] && cp -f "$src/sysctl.conf" /etc/sysctl.conf && log "  恢复 sysctl.conf"
+	uci commit
+	[ -x /etc/init.d/sysctl ] && /etc/init.d/sysctl restart >/dev/null 2>&1
+	ubus call network reload >/dev/null 2>&1
+	[ -x /etc/init.d/odhcpd ] && /etc/init.d/odhcpd restart >/dev/null 2>&1
+	[ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1
+	[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload >/dev/null 2>&1
+	log "  恢复完成"
+}
+
+usage() {
+	cat <<EOF
+用法: ontoneshot <命令>
+  wan       配置上网（pppoe / dhcp / static）
+  iptv      配置 IPTV
+  ipv6      一键开启 IPv6
+  all       全部执行
+  backup    备份当前配置
+  restore   恢复最近备份
+EOF
+}
+
+case "$1" in
+	wan|iptv|ipv6)
+		[ "$2" = "--no-backup" ] || do_backup
+		"apply_$1" || exit 1
+		;;
+	all)
+		do_backup
+		apply_wan && apply_iptv && apply_ipv6 || exit 1
+		;;
+	backup) do_backup ;;
+	reapply) reapply_bridge_tweaks ;;
+	reapply-wait) reapply_wait ;;
+	restore) do_restore ;;
+	*) usage; exit 1 ;;
+esac
+exit 0

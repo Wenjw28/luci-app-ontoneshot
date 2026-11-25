@@ -1,0 +1,34 @@
+{
+	"luci-app-ontoneshot": {
+		"description": "Grant access to ontoneshot provisioning",
+		"read": {
+			"ubus": {
+				"ontoneshot": [
+					"status"
+				]
+			},
+			"uci": [
+				"ontoneshot"
+			]
+		},
+		"write": {
+			"ubus": {
+				"ontoneshot": [
+					"save",
+					"apply_wan",
+					"apply_iptv",
+					"apply_ipv6",
+					"apply_all",
+					"backup",
+					"restore"
+				]
+			},
+			"uci": [
+				"ontoneshot",
+				"network",
+				"dhcp",
+				"firewall"
+			]
+		}
+	}
+}

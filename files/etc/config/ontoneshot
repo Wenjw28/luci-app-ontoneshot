@@ -1,0 +1,18 @@
+config settings 'settings'
+	option wan_proto 'pppoe'
+	option wan_vlan ''
+	option wan_user ''
+	option wan_pass ''
+	option wan_ip ''
+	option wan_gw ''
+
+	option iptv_enabled '1'
+	option iptv_vlan ''
+	option iptv_mcast_vlan ''
+	option iptv_port ''
+	option iptv_priority ''
+
+	option ipv6_enabled '1'
+	option ipv6_ra_default '1'
+	option ipv6_pd '1'
+	option ipv6_pd_size ''

@@ -1,0 +1,15 @@
+{
+	"admin/network/ontoneshot": {
+		"title": "光猫一键配置",
+		"order": 88,
+		"action": {
+			"type": "view",
+			"path": "ontoneshot/overview"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-ontoneshot"
+			]
+		}
+	}
+}

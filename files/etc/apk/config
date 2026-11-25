@@ -1,0 +1,7 @@
+# apk-tools 配置文件（OpenWrt 24.10+ / PonWrt 使用 apk，不是 opkg）
+# 生效方式：apk 启动时自动读取 /etc/apk/config
+#
+# allow-untrusted: 允许安装未签名或签名不受信任的软件包
+#   - 装了第三方源/local 编译的 apk 时必需
+#   - 校验只在安装时生效；安装后包内容仍受 apk database 校验
+allow-untrusted

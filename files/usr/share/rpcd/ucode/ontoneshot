@@ -1,0 +1,139 @@
+#!/usr/bin/ucode
+// ontoneshot rpcd backend
+'use strict';
+
+import { popen } from 'fs';
+import { cursor } from 'uci';
+
+const SCRIPT = '/usr/bin/ontoneshot';
+const CONFIG = 'ontoneshot';
+
+function runScript(args) {
+	let fd = popen('/bin/sh ' + SCRIPT + ' ' + args + ' 2>&1');
+	if (!fd)
+		return { ok: false, log: '无法执行 ' + SCRIPT };
+	let out = fd.read('all') ?? '';
+	fd.close();
+	return { ok: !match(out, /(^|\n)ERROR: /), log: out };
+}
+
+function readConfig() {
+	let c = cursor();
+	let v = c.get_all(CONFIG, 'settings') ?? {};
+	return {
+		wan_proto: v.wan_proto ?? 'pppoe',
+		wan_vlan: v.wan_vlan ?? '',
+		wan_user: v.wan_user ?? '',
+		wan_pass: v.wan_pass ?? '',
+		wan_ip: v.wan_ip ?? '',
+		wan_gw: v.wan_gw ?? '',
+		iptv_enabled: v.iptv_enabled ?? '1',
+		iptv_vlan: v.iptv_vlan ?? '',
+		iptv_mcast_vlan: v.iptv_mcast_vlan ?? '',
+		iptv_port: v.iptv_port ?? '',
+		iptv_priority: v.iptv_priority ?? '',
+		ipv6_enabled: v.ipv6_enabled ?? '1',
+		ipv6_ra_default: v.ipv6_ra_default ?? '1',
+		ipv6_pd: v.ipv6_pd ?? '0',
+		ipv6_pd_size: v.ipv6_pd_size ?? ''
+	};
+}
+
+function status() {
+	let st = { config: readConfig() };
+	let fd, out;
+
+	fd = popen('/sbin/ifstatus wan 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.wan_up = match(out, /"up":\s*true/) != null;
+	let m = match(out, /"address":\s*"([0-9.]+)"/);
+	st.wan_ip = m ? m[1] : '';
+
+	fd = popen('ip -6 addr show br-lan 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	let v6 = '';
+	for (let line in split(out, '\n')) {
+		line = trim(line);
+		if (match(line, /inet6 .* scope global/))
+			v6 += (length(v6) ? '\n' : '') + replace(line, /^inet6\s+/, '');
+	}
+	st.ipv6_lan = v6;
+	st.ipv6_ok = length(v6) > 0;
+
+	fd = popen('/sbin/ifstatus wan_6 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.ipv6_wan_up = match(out, /"up":\s*true/) != null;
+	m = match(out, /"address":\s*"([0-9a-fA-F:]+)/);
+	st.ipv6_prefix = m ? m[1] : '';
+
+	fd = popen('/sbin/ifstatus iptv 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.iptv_up = match(out, /"up":\s*true/) != null;
+
+	fd = popen('readlink -f /root/ontoneshot/latest 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.backup = trim(out);
+
+	fd = popen('uci -q get network.wan.device 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.wan_device = trim(out);
+
+	fd = popen('uci -q get dhcp.lan.ra_default 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.ra_default = trim(out) === '1';
+
+	fd = popen('uci -q get network.pon0_iptv_mcast.name 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	st.mcast_vlan = trim(out);
+
+	// 隐私：不回显完整宽带账号，只给掩码
+	fd = popen('uci -q get network.wan.username 2>/dev/null');
+	out = fd ? (fd.read('all') ?? '') : '';
+	if (fd) fd.close();
+	out = trim(out);
+	st.wan_account = (length(out) > 4)
+		? substr(out, 0, 3) + '****' + substr(out, length(out) - 2)
+		: (length(out) ? '****' : '');
+
+	return st;
+}
+
+function saveConfig(settings) {
+	let c = cursor();
+	let keys = [
+		'wan_proto', 'wan_vlan', 'wan_user', 'wan_pass', 'wan_ip', 'wan_gw',
+		'iptv_enabled', 'iptv_vlan', 'iptv_mcast_vlan', 'iptv_port', 'iptv_priority',
+		'ipv6_enabled', 'ipv6_ra_default', 'ipv6_pd', 'ipv6_pd_size'
+	];
+	c.set(CONFIG, 'settings', 'settings');
+	for (let k in keys) {
+		if (settings[k] == null)
+			continue;
+		c.set(CONFIG, 'settings', k, '' + settings[k]);
+	}
+	return c.commit(CONFIG) ? { ok: true } : { ok: false, error: 'commit failed' };
+}
+
+const methods = {
+	status: { call: () => status() },
+	apply_wan: { call: () => runScript('wan') },
+	apply_iptv: { call: () => runScript('iptv') },
+	apply_ipv6: { call: () => runScript('ipv6') },
+	apply_all: { call: () => runScript('all') },
+	backup: { call: () => runScript('backup') },
+	restore: { call: () => runScript('restore') },
+	save: {
+		args: { settings: {} },
+		call: (req) => saveConfig(req.args?.settings ?? {})
+	}
+};
+
+return { 'ontoneshot': methods };

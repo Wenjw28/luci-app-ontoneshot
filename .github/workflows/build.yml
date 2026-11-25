@@ -26,31 +26,34 @@ jobs:
         run: |
           set -u
           FAIL=0
+          # 扫描范围：仓库内文本文件，排除 .github（含规则本身）与 .git
+          git ls-files | grep -v '^\.github/' > /tmp/files.txt
+          scan() { xargs -r -a /tmp/files.txt grep "$@" 2>/dev/null; }
 
           echo '### 1. 手机号 / 宽带账号'
-          if git ls-files -z | xargs -0 grep -nHoE '\b1[3-9][0-9]{9}\b' 2>/dev/null; then
+          if scan -nHoE '\b1[3-9][0-9]{9}\b'; then
             echo '::error::检测到疑似手机号或宽带账号'; FAIL=1
           else echo '  未发现'; fi
 
           echo '### 2. MAC 地址'
-          if git ls-files -z | xargs -0 grep -nHoEi '\b([0-9a-f]{2}:){5}[0-9a-f]{2}\b' 2>/dev/null; then
+          if scan -nHoEi '\b([0-9a-f]{2}:){5}[0-9a-f]{2}\b'; then
             echo '::error::检测到 MAC 地址'; FAIL=1
           else echo '  未发现'; fi
 
           echo '### 3. IPv4 地址'
-          if git ls-files -z | xargs -0 grep -nHoE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' 2>/dev/null \
+          if scan -nHoE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' \
                | grep -vE '0\.0\.0\.0|127\.0\.0\.1|255\.255\.255\.0|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.'; then
             echo '::error::检测到 IP 地址（文档保留段除外）'; FAIL=1
           else echo '  未发现'; fi
 
           echo '### 4. IPv6 地址'
-          if git ls-files -z | xargs -0 grep -nHoE '\b([0-9a-fA-F]{1,4}:){3,}[0-9a-fA-F]{0,4}\b' 2>/dev/null \
+          if scan -nHoE '\b([0-9a-fA-F]{1,4}:){3,}[0-9a-fA-F]{0,4}\b' \
                | grep -viE '2001:db8|fd00|fe80|::1|::/0|::ffff'; then
             echo '::error::检测到 IPv6 地址（文档保留段除外）'; FAIL=1
           else echo '  未发现'; fi
 
           echo '### 5. 设备序列号 / 型号'
-          if git ls-files -z | xargs -0 grep -nHiE '5A544547|9938506035C|ZTEG|F7015|FiberHome|HG5382' 2>/dev/null; then
+          if scan -nHiE '5A544547|9938506035C|ZTEG|F7015|FiberHome|HG5382'; then
             echo '::error::检测到设备序列号或型号'; FAIL=1
           else echo '  未发现'; fi
 
@@ -64,7 +67,7 @@ jobs:
           [ "$BAD" = "1" ] && FAIL=1 || echo '  未发现'
 
           echo '### 7. 密码字段'
-          if git ls-files -z | xargs -0 grep -nHiE '(password|passwd)\s*[:=]\s*["'"'"']?[A-Za-z0-9!@#\$%^&*_+-]{6,}' 2>/dev/null \
+          if scan -nHiE '(password|passwd)\s*[:=]\s*["'"'"']?[A-Za-z0-9!@#\$%^&*_+-]{6,}' \
                | grep -viE 'wan_pass|password\?|type.*password|password\.|placeholder|为空'; then
             echo '::notice::上方为疑似硬编码密码，请人工确认'
           else echo '  未发现'; fi

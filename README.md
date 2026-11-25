@@ -32,7 +32,7 @@ License: GPL-2.0
 ## 适配环境
 
 - PonWrt SNAPSHOT（ImmortalWrt 25.x/26.x 快照），LuCI 26.x JS 框架，apk 包管理
-- 已在 **FiberHome HG5382A**（airoha/an7581 平台，PonWrt 快照）实测通过
+- 已在 airoha/an7581 平台的 PonWrt 设备实测通过
 - UCI + rpcd + LuCI，纯配置改动，不安装任何额外组件
 
 ## 安装
